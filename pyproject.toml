@@ -9,6 +9,9 @@ dependencies = [
     "tencentcloud-sdk-python-domain>=3.1.65",
 ]
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",

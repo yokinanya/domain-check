@@ -4,18 +4,20 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from domain_check_info import DomainCheckResult, parse_domain_check_record
-from domain_watch import (
+from domain_watch.config import (
     DEFAULT_INTERVAL_SECONDS,
     DEFAULT_NEAR_EXPIRY_INTERVAL_SECONDS,
-    CliDomainCheckRunner,
     WatchConfig,
     load_config,
+)
+from domain_watch.domain_check_cli import CliDomainCheckRunner
+from domain_watch.domain_check_info import DomainCheckResult, parse_domain_check_record
+from domain_watch.main import (
     next_watch_interval,
     tencent_check_candidate_names,
     watch_once,
 )
-from tencent_domain import MANUAL_BALANCE_PAY_MODE, TencentDomainResult
+from domain_watch.tencent_domain import MANUAL_BALANCE_PAY_MODE, TencentDomainResult
 
 
 class FakeRunner:
@@ -196,9 +198,9 @@ def test_missing_required_environment_variable_raises(monkeypatch: pytest.Monkey
 
 
 def test_missing_domain_check_cli_raises_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("domain_watch.shutil.which", lambda _executable: None)
+    monkeypatch.setattr("domain_watch.domain_check_cli.shutil.which", lambda _executable: None)
 
-    with pytest.raises(RuntimeError, match="cargo install domain-check"):
+    with pytest.raises(RuntimeError, match="DOMAIN_CHECK_BIN"):
         CliDomainCheckRunner()
 
 

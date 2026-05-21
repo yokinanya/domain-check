@@ -22,6 +22,12 @@ cargo install domain-check
 uv sync
 ```
 
+如果 `domain-check` 不在 `PATH`，可以在 `.env` 中配置完整路径：
+
+```bash
+DOMAIN_CHECK_BIN=/home/you/.cargo/bin/domain-check
+```
+
 ## 配置
 
 复制示例配置后填写真实值：
@@ -46,6 +52,7 @@ export DOMAIN_WATCH_INTERVAL_SECONDS=3600
 export DOMAIN_NEAR_EXPIRY_INTERVAL_SECONDS=5
 export DOMAIN_EXPIRY_ACCELERATION_DAYS=7
 export DOMAIN_PERIOD=1
+export DOMAIN_CHECK_BIN="domain-check"
 ```
 
 监听频率规则：
@@ -93,6 +100,6 @@ uv run scripts/check_tencent_domain.py
 
 ```bash
 ruff check .
-uv run -m py_compile domain_watch.py domain_check_info.py env_loader.py push_notify.py tencent_domain.py scripts/check_tencent_domain.py
+uv run -m py_compile domain_watch.py src/domain_watch/main.py src/domain_watch/domain_check_info.py src/domain_watch/env_loader.py src/domain_watch/push_notify.py src/domain_watch/tencent_domain.py scripts/check_tencent_domain.py
 uv run -m pytest tests
 ```

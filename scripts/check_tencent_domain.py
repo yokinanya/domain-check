@@ -4,10 +4,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from domain_watch import load_config, print_domain_result
-from env_loader import load_dotenv
-from tencent_domain import TencentSdkDomainClient
+from domain_watch.env_loader import load_dotenv
+from domain_watch.main import load_config, print_domain_result
+from domain_watch.tencent_domain import TencentSdkDomainClient
 
 
 def main() -> None:
