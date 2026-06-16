@@ -48,20 +48,24 @@ export DOMAIN_WATCH_DOMAINS="example.com,example.net"
 可选环境变量：
 
 ```bash
-export DOMAIN_WATCH_INTERVAL_SECONDS=3600
-export DOMAIN_NEAR_EXPIRY_INTERVAL_SECONDS=5
-export DOMAIN_EXPIRY_ACCELERATION_DAYS=7
+export DOMAIN_WATCH_INTERVAL_SECONDS=86400
+export DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS=86400
 export DOMAIN_PERIOD=1
+export DOMAIN_WATCH_STATE_FILE="domain_watch_state.json"
 export DOMAIN_CHECK_BIN="domain-check"
 ```
 
 监听频率规则：
 
-- `DOMAIN_WATCH_INTERVAL_SECONDS`：普通监听间隔，默认 3600 秒。
-- `DOMAIN_NEAR_EXPIRY_INTERVAL_SECONDS`：临近过期时的监听间隔，默认 5 秒。
-- `DOMAIN_EXPIRY_ACCELERATION_DAYS`：距离过期多少天内切换到高频监听，默认 7 天。
+- `DOMAIN_WATCH_INTERVAL_SECONDS`：普通监听间隔，默认 86400 秒（1 天）。
+- `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS`：已过期域名的监听间隔，默认 86400 秒（1 天）。
+- 默认策略不区分普通期和临近期；域名过期前后都使用低频查询，因为目标域名通常不是热门域名。
+- 如果你确实想加快某些过期域名的监听频率，可以把 `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS` 改小，例如 `3600`（1 小时）或 `600`（10 分钟）。
 - 脚本会通过 `domain-check --info --json` 读取过期时间；只要返回的过期时间仍在未来，就不会调用腾讯云 API。
 - 如果某个域名过期时间未知，会打印 `expires_at=unknown`，并继续使用普通监听间隔。
+- 如果 `domain-check --info --json` 返回域名状态码，脚本会把状态码写入状态文件；首次记录只建立基线，后续状态码变化时会发送推送通知。
+- 已提交注册任务的域名会从监听列表中移除，状态持久化到 `DOMAIN_WATCH_STATE_FILE`，重启后不再重复查询。
+- 如果你想让同一个域名重新开始监听，可以手动编辑状态文件，把它从 `active` 加回；或临时删除状态文件。
 
 推送配置使用 `onepush`，不配置 `ONEPUSH_PROVIDER` 时不会推送：
 
@@ -72,6 +76,7 @@ export ONEPUSH_TITLE_PREFIX='[domain-watch] '
 ```
 
 `ONEPUSH_PARAMS_JSON` 会原样传给 `onepush.notify()`，不同渠道需要的参数不同，参考 onepush 文档。
+推送事件包括腾讯云注册前确认、注册任务提交，以及 RDAP/WHOIS 状态码变化。状态码变化通知只会在已有历史状态后触发，避免首次启动时产生批量通知。
 
 注册参数固定为：
 
@@ -88,7 +93,7 @@ export ONEPUSH_TITLE_PREFIX='[domain-watch] '
 uv run domain_watch.py
 ```
 
-脚本启动时会自动读取当前目录的 `.env`。脚本会持续监听，不设置最大轮数。已在当前进程提交过注册任务的域名会记录在内存里，避免同一进程重复提交。
+脚本启动时会自动读取当前目录的 `.env`。脚本会持续监听，不设置最大轮数。已提交注册任务的域名会从监听列表移除并写入 `domain_watch_state.json`，避免进程重启后重复查询和提交。所有活跃域名都被移除后，监听循环会自动结束。
 
 只测试腾讯云查询接口，不提交注册：
 
@@ -99,7 +104,6 @@ uv run scripts/check_tencent_domain.py
 ## 验证
 
 ```bash
-ruff check .
-uv run -m py_compile domain_watch.py src/domain_watch/main.py src/domain_watch/domain_check_info.py src/domain_watch/env_loader.py src/domain_watch/push_notify.py src/domain_watch/tencent_domain.py scripts/check_tencent_domain.py
+ruff check src tests
 uv run -m pytest tests
 ```

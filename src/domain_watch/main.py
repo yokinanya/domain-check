@@ -3,13 +3,14 @@ from __future__ import annotations
 import signal
 import subprocess
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from domain_watch.config import WatchConfig, load_config
 from domain_watch.domain_check_cli import CliDomainCheckRunner, DomainCheckRunner
 from domain_watch.domain_check_info import DomainCheckResult
 from domain_watch.env_loader import load_dotenv
 from domain_watch.push_notify import PushNotifier, load_push_notifier
+from domain_watch.state import WatchState, init_state, save_state
 from domain_watch.tencent_domain import (
     TencentDomainClient,
     TencentDomainResult,
@@ -31,12 +32,12 @@ def register_available_domains(
     config: WatchConfig,
     client: TencentDomainClient,
     candidate_domains: tuple[str, ...],
-    submitted_domains: frozenset[str],
+    state: WatchState,
     notifier: PushNotifier | None,
-) -> frozenset[str]:
+) -> None:
     confirmed_domains = []
     for domain in candidate_domains:
-        if domain in submitted_domains:
+        if not state.is_active(domain):
             continue
         result = client.check_domain(domain, config.period)
         print_domain_result(result)
@@ -44,12 +45,21 @@ def register_available_domains(
         if result.available:
             confirmed_domains.append(domain)
     if not confirmed_domains:
-        return submitted_domains
+        return
     domains_to_register = tuple(confirmed_domains)
     response = client.create_domain_batch(domains_to_register, config)
     print_register_response(domains_to_register, response)
+    log_id = getattr(response, "LogId", None)
+    request_id = getattr(response, "RequestId", None)
+    for domain in domains_to_register:
+        state.remove(
+            domain,
+            reason="register_submitted",
+            request_id=request_id,
+            log_id=str(log_id) if log_id is not None else None,
+        )
+    save_state(config.state_file, state)
     notify_register_response(notifier, domains_to_register, response)
-    return submitted_domains.union(domains_to_register)
 
 
 def print_register_response(domains: tuple[str, ...], response: object) -> None:
@@ -91,7 +101,12 @@ def notify_register_response(
     request_id = getattr(response, "RequestId", None)
     notifier.send(
         "注册任务已提交",
-        f"域名: {', '.join(domains)}\nLogId: {log_id}\nRequestId: {request_id}",
+        (
+            f"以下域名已提交注册并移出监听列表：{', '.join(domains)}\n"
+            f"LogId: {log_id}\n"
+            f"RequestId: {request_id}\n"
+            "后续请到腾讯云控制台确认订单并完成支付。"
+        ),
     )
 
 
@@ -99,29 +114,69 @@ def watch_once(
     config: WatchConfig,
     runner: DomainCheckRunner,
     client: TencentDomainClient,
-    submitted_domains: frozenset[str],
+    state: WatchState,
     notifier: PushNotifier | None = None,
-) -> tuple[frozenset[str], int]:
-    remaining_domains = tuple(
-        domain for domain in config.domains if domain not in submitted_domains
-    )
+) -> int:
+    remaining_domains = tuple(state.active)
     if not remaining_domains:
-        print("All target domains were already submitted in this process.")
-        return submitted_domains, config.interval_seconds
+        print("No active domains to watch.")
+        return config.interval_seconds
     checked_domains = runner.check_domains(remaining_domains)
+    notify_domain_status_changes(config, state, checked_domains, notifier)
     next_interval = next_watch_interval(config, checked_domains)
     candidate_domains = tencent_check_candidate_names(checked_domains, datetime.now(UTC))
     if not candidate_domains:
         print(f"No RDAP/WHOIS available candidates: {list(remaining_domains)}")
-        return submitted_domains, next_interval
-    submitted = register_available_domains(
+        return next_interval
+    register_available_domains(
         config,
         client,
         candidate_domains,
-        submitted_domains,
+        state,
         notifier,
     )
-    return submitted, next_interval
+    return next_interval
+
+
+def notify_domain_status_changes(
+    config: WatchConfig,
+    state: WatchState,
+    results: tuple[DomainCheckResult, ...],
+    notifier: PushNotifier | None,
+) -> None:
+    changed_results: list[tuple[DomainCheckResult, tuple[str, ...]]] = []
+    state_changed = False
+    for result in results:
+        previous_statuses = state.update_statuses(result.domain, result.statuses)
+        if previous_statuses is None:
+            continue
+        state_changed = True
+        if previous_statuses:
+            changed_results.append((result, previous_statuses))
+    if state_changed:
+        save_state(config.state_file, state)
+    for result, previous_statuses in changed_results:
+        notify_domain_status_change(notifier, result, previous_statuses)
+
+
+def notify_domain_status_change(
+    notifier: PushNotifier | None,
+    result: DomainCheckResult,
+    previous_statuses: tuple[str, ...],
+) -> None:
+    if notifier is None:
+        return
+    current_statuses = format_statuses(result.statuses)
+    notifier.send(
+        f"域名状态码更新 {result.domain}",
+        (
+            f"域名: {result.domain}\n"
+            f"原状态码: {format_statuses(previous_statuses)}\n"
+            f"新状态码: {current_statuses}\n"
+            f"可注册: {'是' if result.available else '否'}\n"
+            f"过期时间: {format_expires_at(result)}"
+        ),
+    )
 
 
 def tencent_check_candidate_names(
@@ -143,18 +198,31 @@ def next_watch_interval(
     config: WatchConfig,
     results: tuple[DomainCheckResult, ...],
 ) -> int:
-    threshold = datetime.now(UTC) + timedelta(days=config.expiry_acceleration_days)
-    for result in results:
-        print_domain_check_result(result)
-        if result.expires_at is not None and result.expires_at <= threshold:
-            return config.near_expiry_interval_seconds
+    now = datetime.now(UTC)
+    any_expired = any(
+        result.expires_at is not None and result.expires_at <= now
+        for result in results
+    )
+    if any_expired:
+        return config.expired_interval_seconds
     return config.interval_seconds
 
 
 def print_domain_check_result(result: DomainCheckResult) -> None:
     expires_at = result.expires_at.isoformat() if result.expires_at else "unknown"
     status = "AVAILABLE" if result.available else "TAKEN"
-    print(f"domain-check {result.domain} {status} expires_at={expires_at}")
+    print(
+        f"domain-check {result.domain} {status} "
+        f"expires_at={expires_at} statuses={format_statuses(result.statuses)}"
+    )
+
+
+def format_expires_at(result: DomainCheckResult) -> str:
+    return result.expires_at.isoformat() if result.expires_at else "unknown"
+
+
+def format_statuses(statuses: tuple[str, ...]) -> str:
+    return ", ".join(statuses) if statuses else "unknown"
 
 
 def watch_forever(
@@ -163,15 +231,15 @@ def watch_forever(
     client: TencentDomainClient,
     notifier: PushNotifier | None,
 ) -> None:
-    submitted_domains: frozenset[str] = frozenset()
+    state = init_state(config.state_file, config.domains)
     stop_signal = StopSignal()
-    while not stop_signal.received:
+    while not stop_signal.received and state.active:
         try:
-            submitted_domains, next_interval = watch_once(
+            next_interval = watch_once(
                 config,
                 runner,
                 client,
-                submitted_domains,
+                state,
                 notifier,
             )
         except subprocess.CalledProcessError as error:
@@ -180,6 +248,7 @@ def watch_forever(
                 break
             raise
         stop_signal.wait(next_interval)
+    print("Watch loop ended.")
 
 
 class StopSignal:

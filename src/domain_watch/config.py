@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
-DEFAULT_INTERVAL_SECONDS = 3600
-DEFAULT_NEAR_EXPIRY_INTERVAL_SECONDS = 5
-DEFAULT_EXPIRY_ACCELERATION_DAYS = 7
+DEFAULT_INTERVAL_SECONDS = 86_400
+DEFAULT_EXPIRED_INTERVAL_SECONDS = 86_400
 DEFAULT_PERIOD = 1
 DEFAULT_DOMAIN_CHECK_BIN = "domain-check"
+DEFAULT_STATE_FILE = Path("domain_watch_state.json")
 
 
 @dataclass(frozen=True)
@@ -16,11 +17,11 @@ class WatchConfig:
     secret_key: str
     template_id: str
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
-    near_expiry_interval_seconds: int = DEFAULT_NEAR_EXPIRY_INTERVAL_SECONDS
-    expiry_acceleration_days: int = DEFAULT_EXPIRY_ACCELERATION_DAYS
+    expired_interval_seconds: int = DEFAULT_EXPIRED_INTERVAL_SECONDS
     period: int = DEFAULT_PERIOD
     domains: tuple[str, ...] = ()
     domain_check_bin: str = DEFAULT_DOMAIN_CHECK_BIN
+    state_file: Path = DEFAULT_STATE_FILE
 
 
 def require_env(name: str) -> str:
@@ -48,6 +49,13 @@ def read_domains_env(name: str) -> tuple[str, ...]:
     raise ValueError(f"{name} must contain at least one domain")
 
 
+def load_state_file_env(name: str, default: Path) -> Path:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return Path(raw_value)
+
+
 def load_config() -> WatchConfig:
     return WatchConfig(
         secret_id=require_env("TENCENTCLOUD_SECRET_ID"),
@@ -57,15 +65,15 @@ def load_config() -> WatchConfig:
             "DOMAIN_WATCH_INTERVAL_SECONDS",
             DEFAULT_INTERVAL_SECONDS,
         ),
-        near_expiry_interval_seconds=read_positive_int_env(
-            "DOMAIN_NEAR_EXPIRY_INTERVAL_SECONDS",
-            DEFAULT_NEAR_EXPIRY_INTERVAL_SECONDS,
-        ),
-        expiry_acceleration_days=read_positive_int_env(
-            "DOMAIN_EXPIRY_ACCELERATION_DAYS",
-            DEFAULT_EXPIRY_ACCELERATION_DAYS,
+        expired_interval_seconds=read_positive_int_env(
+            "DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS",
+            DEFAULT_EXPIRED_INTERVAL_SECONDS,
         ),
         period=read_positive_int_env("DOMAIN_PERIOD", DEFAULT_PERIOD),
         domains=read_domains_env("DOMAIN_WATCH_DOMAINS"),
         domain_check_bin=os.getenv("DOMAIN_CHECK_BIN", DEFAULT_DOMAIN_CHECK_BIN),
+        state_file=load_state_file_env(
+            "DOMAIN_WATCH_STATE_FILE",
+            DEFAULT_STATE_FILE,
+        ),
     )
