@@ -17,9 +17,14 @@ STATUS_FIELDS = (
 @dataclass(frozen=True)
 class DomainCheckResult:
     domain: str
-    available: bool
+    available: bool | None
     expires_at: datetime | None
     statuses: tuple[str, ...] = ()
+    error_message: str | None = None
+
+    @property
+    def query_failed(self) -> bool:
+        return self.available is None or self.error_message is not None
 
 
 def parse_domain_check_record(record: object) -> DomainCheckResult:
@@ -28,11 +33,18 @@ def parse_domain_check_record(record: object) -> DomainCheckResult:
     domain = record.get("domain")
     if not isinstance(domain, str):
         raise ValueError("domain-check JSON record missing string domain")
+    available = record.get("available")
+    error_message = record.get("error_message")
     return DomainCheckResult(
         domain=domain,
-        available=record.get("available") is True,
+        available=available if isinstance(available, bool) else None,
         expires_at=parse_expiration_time(record),
         statuses=parse_statuses(record),
+        error_message=(
+            error_message.strip()
+            if isinstance(error_message, str) and error_message.strip()
+            else None
+        ),
     )
 
 

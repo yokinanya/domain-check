@@ -6,6 +6,7 @@ from pathlib import Path
 
 DEFAULT_INTERVAL_SECONDS = 86_400
 DEFAULT_EXPIRED_INTERVAL_SECONDS = 86_400
+DEFAULT_RETRY_INTERVAL_SECONDS = 300
 DEFAULT_PERIOD = 1
 DEFAULT_DOMAIN_CHECK_BIN = "domain-check"
 DEFAULT_STATE_FILE = Path("domain_watch_state.json")
@@ -18,6 +19,7 @@ class WatchConfig:
     template_id: str
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
     expired_interval_seconds: int = DEFAULT_EXPIRED_INTERVAL_SECONDS
+    retry_interval_seconds: int = DEFAULT_RETRY_INTERVAL_SECONDS
     period: int = DEFAULT_PERIOD
     domains: tuple[str, ...] = ()
     domain_check_bin: str = DEFAULT_DOMAIN_CHECK_BIN
@@ -68,6 +70,10 @@ def load_config() -> WatchConfig:
         expired_interval_seconds=read_positive_int_env(
             "DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS",
             DEFAULT_EXPIRED_INTERVAL_SECONDS,
+        ),
+        retry_interval_seconds=read_positive_int_env(
+            "DOMAIN_WATCH_RETRY_INTERVAL_SECONDS",
+            DEFAULT_RETRY_INTERVAL_SECONDS,
         ),
         period=read_positive_int_env("DOMAIN_PERIOD", DEFAULT_PERIOD),
         domains=read_domains_env("DOMAIN_WATCH_DOMAINS"),

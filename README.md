@@ -50,6 +50,7 @@ export DOMAIN_WATCH_DOMAINS="example.com,example.net"
 ```bash
 export DOMAIN_WATCH_INTERVAL_SECONDS=86400
 export DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS=86400
+export DOMAIN_WATCH_RETRY_INTERVAL_SECONDS=300
 export DOMAIN_PERIOD=1
 export DOMAIN_WATCH_STATE_FILE="domain_watch_state.json"
 export DOMAIN_CHECK_BIN="domain-check"
@@ -59,11 +60,14 @@ export DOMAIN_CHECK_BIN="domain-check"
 
 - `DOMAIN_WATCH_INTERVAL_SECONDS`：普通监听间隔，默认 86400 秒（1 天）。
 - `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS`：已过期域名的监听间隔，默认 86400 秒（1 天）。
+- `DOMAIN_WATCH_RETRY_INTERVAL_SECONDS`：查询失败后的重试间隔，默认 300 秒（5 分钟）。
 - 默认策略不区分普通期和临近期；域名过期前后都使用低频查询，因为目标域名通常不是热门域名。
 - 如果你确实想加快某些过期域名的监听频率，可以把 `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS` 改小，例如 `3600`（1 小时）或 `600`（10 分钟）。
-- 脚本会通过 `domain-check --info --json` 读取过期时间；只要返回的过期时间仍在未来，就不会调用腾讯云 API。
+- 脚本会通过 `domain-check --info --json --no-whois` 查询，只使用 RDAP/bootstrap 结果，不回退到 WHOIS；只要返回的过期时间仍在未来，就不会调用腾讯云 API。
 - 如果某个域名过期时间未知，会打印 `expires_at=unknown`，并继续使用普通监听间隔。
 - 如果 `domain-check --info --json` 返回域名状态码，脚本会把状态码写入状态文件；首次记录只建立基线，后续状态码变化时会发送推送通知。
+- 如果查询返回 `error_message`、`available=null` 或缺少对应域名的结果，脚本不会记录状态变化，也不会调用腾讯云 API，并在重试间隔后重新查询。
+- 如果查询成功但没有返回状态码，脚本会保留已有状态码基线，不把空结果记录为一次变化。
 - 已提交注册任务的域名会从监听列表中移除，状态持久化到 `DOMAIN_WATCH_STATE_FILE`，重启后不再重复查询。
 - 如果你想让同一个域名重新开始监听，可以手动编辑状态文件，把它从 `active` 加回；或临时删除状态文件。
 

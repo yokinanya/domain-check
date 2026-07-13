@@ -123,10 +123,23 @@ def watch_once(
         return config.interval_seconds
     checked_domains = runner.check_domains(remaining_domains)
     notify_domain_status_changes(config, state, checked_domains, notifier)
-    next_interval = next_watch_interval(config, checked_domains)
+    next_interval = next_watch_interval(config, checked_domains, remaining_domains)
+    checked_domain_names = {result.domain for result in checked_domains}
+    for domain in remaining_domains:
+        if domain not in checked_domain_names:
+            print(
+                f"domain-check {domain} FAILED error=no result; "
+                f"retrying in {next_interval}s"
+            )
+    for result in checked_domains:
+        if result.query_failed:
+            print(
+                f"domain-check {result.domain} FAILED "
+                f"error={result.error_message or 'no result'}; retrying in {next_interval}s"
+            )
     candidate_domains = tencent_check_candidate_names(checked_domains, datetime.now(UTC))
     if not candidate_domains:
-        print(f"No RDAP/WHOIS available candidates: {list(remaining_domains)}")
+        print(f"No RDAP available candidates: {list(remaining_domains)}")
         return next_interval
     register_available_domains(
         config,
@@ -147,6 +160,8 @@ def notify_domain_status_changes(
     changed_results: list[tuple[DomainCheckResult, tuple[str, ...]]] = []
     state_changed = False
     for result in results:
+        if result.query_failed or not result.statuses:
+            continue
         previous_statuses = state.update_statuses(result.domain, result.statuses)
         if previous_statuses is None:
             continue
@@ -186,7 +201,7 @@ def tencent_check_candidate_names(
     return tuple(
         result.domain
         for result in results
-        if result.available and not has_future_expiration(result, now)
+        if result.available is True and not has_future_expiration(result, now)
     )
 
 
@@ -197,7 +212,13 @@ def has_future_expiration(result: DomainCheckResult, now: datetime) -> bool:
 def next_watch_interval(
     config: WatchConfig,
     results: tuple[DomainCheckResult, ...],
+    expected_domains: tuple[str, ...] = (),
 ) -> int:
+    result_domains = {result.domain for result in results}
+    if any(result.query_failed for result in results) or any(
+        domain not in result_domains for domain in expected_domains
+    ):
+        return config.retry_interval_seconds
     now = datetime.now(UTC)
     any_expired = any(
         result.expires_at is not None and result.expires_at <= now

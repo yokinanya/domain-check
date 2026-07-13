@@ -5,8 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from domain_watch.config import DEFAULT_INTERVAL_SECONDS, WatchConfig, load_config
-from domain_watch.domain_check_cli import CliDomainCheckRunner
+from domain_watch.config import (
+    DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_RETRY_INTERVAL_SECONDS,
+    WatchConfig,
+    load_config,
+)
+from domain_watch.domain_check_cli import DOMAIN_CHECK_ARGS, CliDomainCheckRunner
 from domain_watch.domain_check_info import (
     DomainCheckResult,
     parse_domain_check_record,
@@ -120,13 +125,13 @@ def expired_domain_check_result(domain: str) -> DomainCheckResult:
     )
 
 
-def test_rdap_unavailable_domains_do_not_call_tencent(tmp_path: Path) -> None:
+def test_missing_domain_check_results_retry_without_calling_tencent(tmp_path: Path) -> None:
     config = build_config(tmp_path)
     fake_client = FakeClient({})
     state = init_state(config.state_file, config.domains)
     next_interval = watch_once(config, FakeRunner(()), fake_client, state)
 
-    assert next_interval == DEFAULT_INTERVAL_SECONDS
+    assert next_interval == DEFAULT_RETRY_INTERVAL_SECONDS
     assert fake_client.check_calls == []
     assert fake_client.register_calls == []
 
@@ -224,6 +229,60 @@ def test_status_change_sends_notification_after_initial_baseline(tmp_path: Path)
     assert load_state(config.state_file).statuses["example.com"] == ("redemptionPeriod",)
 
 
+def test_failed_domain_check_retries_without_recording_status_change(tmp_path: Path) -> None:
+    config = build_config(tmp_path, domains=("guguqiu.cc",))
+    fake_client = FakeClient({})
+    notifier = FakeNotifier()
+    state = init_state(config.state_file, config.domains)
+    watch_once(
+        config,
+        FakeRunner((domain_check_result_with_statuses("guguqiu.cc", ("ok",)),)),
+        fake_client,
+        state,
+        notifier,
+    )
+    failed_result = parse_domain_check_record(
+        {
+            "domain": "guguqiu.cc",
+            "available": None,
+            "method_used": "unknown",
+            "error_message": "Operation timed out after 3s: RDAP request",
+        }
+    )
+
+    next_interval = watch_once(
+        config,
+        FakeRunner((failed_result,)),
+        fake_client,
+        state,
+        notifier,
+    )
+
+    assert next_interval == DEFAULT_RETRY_INTERVAL_SECONDS
+    assert state.statuses["guguqiu.cc"] == ("ok",)
+    assert notifier.messages == []
+    assert fake_client.check_calls == []
+
+
+def test_empty_statuses_do_not_replace_existing_baseline(tmp_path: Path) -> None:
+    config = build_config(tmp_path, domains=("example.com",))
+    fake_client = FakeClient({})
+    notifier = FakeNotifier()
+    state = init_state(config.state_file, config.domains)
+    state.update_statuses("example.com", ("ok",))
+
+    watch_once(
+        config,
+        FakeRunner((domain_check_result("example.com", False),)),
+        fake_client,
+        state,
+        notifier,
+    )
+
+    assert state.statuses["example.com"] == ("ok",)
+    assert notifier.messages == []
+
+
 def test_unexpired_domain_does_not_call_tencent_api(tmp_path: Path) -> None:
     config = build_config(tmp_path, domains=("example.com",))
     fake_client = FakeClient({})
@@ -285,6 +344,20 @@ def test_missing_domain_check_cli_raises_clear_error(monkeypatch: pytest.MonkeyP
 
     with pytest.raises(RuntimeError, match="DOMAIN_CHECK_BIN"):
         CliDomainCheckRunner()
+
+
+def test_domain_check_cli_disables_whois_fallback() -> None:
+    assert "--no-whois" in DOMAIN_CHECK_ARGS
+
+
+def test_load_config_reads_retry_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", "secret-id")
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", "secret-key")
+    monkeypatch.setenv("TENCENT_DOMAIN_TEMPLATE_ID", "tmpl-xxxxxx")
+    monkeypatch.setenv("DOMAIN_WATCH_DOMAINS", "example.com")
+    monkeypatch.setenv("DOMAIN_WATCH_RETRY_INTERVAL_SECONDS", "45")
+
+    assert load_config().retry_interval_seconds == 45
 
 
 def test_state_serialization_roundtrip(tmp_path: Path) -> None:

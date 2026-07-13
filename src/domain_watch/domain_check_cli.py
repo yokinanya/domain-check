@@ -10,7 +10,7 @@ from typing import Protocol
 from domain_watch.config import DEFAULT_DOMAIN_CHECK_BIN
 from domain_watch.domain_check_info import DomainCheckResult, parse_domain_check_record
 
-DOMAIN_CHECK_ARGS = ("--info", "--json", "--yes", "--batch")
+DOMAIN_CHECK_ARGS = ("--info", "--json", "--yes", "--batch", "--no-whois")
 
 
 class DomainCheckRunner(Protocol):
