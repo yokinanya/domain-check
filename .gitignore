@@ -4,5 +4,7 @@
 __pycache__/
 *.py[cod]
 .env
+domain_watch_state.json
+rdap_bootstrap_cache.json
 .agents
 .codex

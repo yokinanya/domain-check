@@ -1,113 +1,89 @@
 # domain-watch
 
-监听 `.env` 中配置的域名，当域名可注册时通过腾讯云域名注册 API 自动提交注册任务。
+根据域名的 RDAP 生命周期预测释放窗口，并在腾讯云确认可注册后自动使用账户余额提交注册。
 
-脚本流程：
+## 工作方式
 
-1. 使用 `domain-check` CLI 做 RDAP/WHOIS 可用性预检查。
-2. 对预检查可用的域名调用腾讯云 `CheckDomain` 做注册前确认。
-3. 对腾讯云确认 `Available=true` 的域名调用 `CreateDomainBatch`，使用账户余额自动注册。
+1. 从 IANA bootstrap 发现域名后缀对应的权威 RDAP 服务。
+2. 新域名立即查询一次过期时间，然后等待到精确 `expires_at`。
+3. 到期后根据 RDAP 状态独立调度：过期/赎回期默认 6 小时，`pendingDelete` 默认 5 分钟。
+4. 用首次发现 `pendingDelete` 的时间区间加默认 5 天，估算释放窗口；窗口开始后每 5 秒查询。
+5. 权威 RDAP 返回 404 后调用腾讯云 `CheckDomain` 二次确认；确认可注册后逐域提交注册。
+6. 持续查询腾讯云异步任务，只有详情状态为 `success` 才停止监听该域名。
 
-## 安装
+RDAP 404 只表示注册局不存在该对象，不保证域名可售。`pendingDelete` 时长也可能因后缀策略不同而变化，因此释放窗口是估算值，可按 TLD 覆盖。
 
-安装 `domain-check` CLI：
-
-```bash
-cargo install domain-check
-```
-
-安装 Python 依赖：
+## 安装与配置
 
 ```bash
 uv sync
-```
-
-如果 `domain-check` 不在 `PATH`，可以在 `.env` 中配置完整路径：
-
-```bash
-DOMAIN_CHECK_BIN=/home/you/.cargo/bin/domain-check
-```
-
-## 配置
-
-复制示例配置后填写真实值：
-
-```bash
 cp .env.example .env
 ```
 
-必填环境变量：
+必填配置：
 
 ```bash
-export TENCENTCLOUD_SECRET_ID="你的 SecretId"
-export TENCENTCLOUD_SECRET_KEY="你的 SecretKey"
-export TENCENT_DOMAIN_TEMPLATE_ID="已实名审核通过的信息模板 ID"
-export DOMAIN_WATCH_DOMAINS="example.com,example.net"
+TENCENTCLOUD_SECRET_ID=你的SecretId
+TENCENTCLOUD_SECRET_KEY=你的SecretKey
+TENCENT_DOMAIN_TEMPLATE_ID=已审核的信息模板ID
+DOMAIN_WATCH_DOMAINS=example.com,example.cc
 ```
 
-可选环境变量：
+核心调度配置：
 
 ```bash
-export DOMAIN_WATCH_INTERVAL_SECONDS=86400
-export DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS=86400
-export DOMAIN_WATCH_RETRY_INTERVAL_SECONDS=300
-export DOMAIN_PERIOD=1
-export DOMAIN_WATCH_STATE_FILE="domain_watch_state.json"
-export DOMAIN_CHECK_BIN="domain-check"
+DOMAIN_WATCH_REDEMPTION_INTERVAL_SECONDS=21600
+DOMAIN_WATCH_PENDING_DELETE_INTERVAL_SECONDS=300
+DOMAIN_WATCH_DROP_INTERVAL_SECONDS=5
+DOMAIN_WATCH_RETRY_INTERVAL_SECONDS=900
+DOMAIN_WATCH_REGISTRATION_POLL_SECONDS=30
+DOMAIN_WATCH_TLD_PENDING_DELETE_DAYS_JSON={"com":5,"cc":5}
 ```
 
-监听频率规则：
-
-- `DOMAIN_WATCH_INTERVAL_SECONDS`：普通监听间隔，默认 86400 秒（1 天）。
-- `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS`：已过期域名的监听间隔，默认 86400 秒（1 天）。
-- `DOMAIN_WATCH_RETRY_INTERVAL_SECONDS`：查询失败后的重试间隔，默认 300 秒（5 分钟）。
-- 默认策略不区分普通期和临近期；域名过期前后都使用低频查询，因为目标域名通常不是热门域名。
-- 如果你确实想加快某些过期域名的监听频率，可以把 `DOMAIN_WATCH_EXPIRED_INTERVAL_SECONDS` 改小，例如 `3600`（1 小时）或 `600`（10 分钟）。
-- 脚本会通过 `domain-check --info --json --no-whois` 查询，只使用 RDAP/bootstrap 结果，不回退到 WHOIS；只要返回的过期时间仍在未来，就不会调用腾讯云 API。
-- 如果某个域名过期时间未知，会打印 `expires_at=unknown`，并继续使用普通监听间隔。
-- 如果 `domain-check --info --json` 返回域名状态码，脚本会把状态码写入状态文件；首次记录只建立基线，后续状态码变化时会发送推送通知。
-- 如果查询返回 `error_message`、`available=null` 或缺少对应域名的结果，脚本不会记录状态变化，也不会调用腾讯云 API，并在重试间隔后重新查询。
-- 如果查询成功但没有返回状态码，脚本会保留已有状态码基线，不把空结果记录为一次变化。
-- 已提交注册任务的域名会从监听列表中移除，状态持久化到 `DOMAIN_WATCH_STATE_FILE`，重启后不再重复查询。
-- 如果你想让同一个域名重新开始监听，可以手动编辑状态文件，把它从 `active` 加回；或临时删除状态文件。
-
-推送配置使用 `onepush`，不配置 `ONEPUSH_PROVIDER` 时不会推送：
+RDAP 配置：
 
 ```bash
-export ONEPUSH_PROVIDER=bark
-export ONEPUSH_PARAMS_JSON='{"key":"你的 Bark key"}'
-export ONEPUSH_TITLE_PREFIX='[domain-watch] '
+RDAP_BOOTSTRAP_URL=https://data.iana.org/rdap/dns.json
+RDAP_BOOTSTRAP_CACHE_FILE=rdap_bootstrap_cache.json
+RDAP_BOOTSTRAP_TTL_SECONDS=86400
+RDAP_REQUESTS_PER_SECOND=1
+RDAP_HOST_LIMITS_JSON={}
+RDAP_HTTP_TIMEOUT_SECONDS=10
 ```
 
-`ONEPUSH_PARAMS_JSON` 会原样传给 `onepush.notify()`，不同渠道需要的参数不同，参考 onepush 文档。
-推送事件包括腾讯云注册前确认、注册任务提交，以及 RDAP/WHOIS 状态码变化。状态码变化通知只会在已有历史状态后触发，避免首次启动时产生批量通知。
+限流按 RDAP 主机共享。收到 429 时优先遵守 `Retry-After`，缺失时冷却 15 分钟；冷却期间明确改用腾讯云查询。腾讯云查询、注册提交和任务详情使用互相独立的限流器。
 
-注册参数固定为：
+推送仍使用 onepush：
 
-- `PayMode=1`：使用账户余额付费
-- `AutoRenewFlag=0`：关闭自动续费
-- `UpdateProhibition=0`：不开启更新锁
-- `TransferProhibition=0`：不开启转移锁
-- `ChannelFrom=pc`
-- `OrderFrom=common`
+```bash
+ONEPUSH_PROVIDER=bark
+ONEPUSH_PARAMS_JSON={"key":"你的Bark key"}
+ONEPUSH_TITLE_PREFIX=[domain-watch]
+```
 
-## 运行
+程序只推送状态转换、限流、错误和注册任务事件，不会在 5 秒窗口重复推送相同的“不可注册”结果。
+
+## 状态与安全语义
+
+`domain_watch_state.json` 使用版本化的逐域状态，保存下一次查询、RDAP 状态、预测窗口、主机冷却和腾讯云 LogId。写入使用原子替换，旧版 `active/removed/statuses` 文件会自动迁移。
+
+提交腾讯云请求前会先保存 `registering` 意图。如果进程在取得 LogId 前中断，重启后该域名会进入 `indeterminate` 并停止自动重试，以避免重复下单。需先在腾讯云确认真实结果，再人工修正对应状态。
+
+注册参数保持：余额支付、1 年默认注册期、关闭自动续费和域名锁。当前不限制溢价或最高价格。
+
+## 运行与验证
 
 ```bash
 uv run domain_watch.py
 ```
 
-脚本启动时会自动读取当前目录的 `.env`。脚本会持续监听，不设置最大轮数。已提交注册任务的域名会从监听列表移除并写入 `domain_watch_state.json`，避免进程重启后重复查询和提交。所有活跃域名都被移除后，监听循环会自动结束。
-
-只测试腾讯云查询接口，不提交注册：
+仅测试腾讯云查询，不提交注册：
 
 ```bash
 uv run scripts/check_tencent_domain.py
 ```
 
-## 验证
-
 ```bash
-ruff check src tests
+ruff check src tests scripts domain_watch.py
 uv run -m pytest tests
 ```

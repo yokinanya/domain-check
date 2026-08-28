@@ -1,303 +1,265 @@
 from __future__ import annotations
 
-import signal
-import subprocess
-import time
-from datetime import UTC, datetime
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
-from domain_watch.config import WatchConfig, load_config
-from domain_watch.domain_check_cli import CliDomainCheckRunner, DomainCheckRunner
-from domain_watch.domain_check_info import DomainCheckResult
-from domain_watch.env_loader import load_dotenv
-from domain_watch.push_notify import PushNotifier, load_push_notifier
-from domain_watch.state import WatchState, init_state, save_state
-from domain_watch.tencent_domain import (
-    TencentDomainClient,
-    TencentDomainResult,
-    TencentSdkDomainClient,
+from domain_watch.config import WatchConfig
+from domain_watch.lifecycle import (
+    apply_rdap_result,
+    due_schedules,
+    in_drop_window,
+    record_failure,
 )
+from domain_watch.push_notify import PushNotifier
+from domain_watch.rdap import (
+    BootstrapData,
+    RdapRateLimited,
+    RdapResult,
+    endpoint_host,
+)
+from domain_watch.registration import notify, poll_registration, process_candidate
+from domain_watch.state import (
+    DomainPhase,
+    DomainSchedule,
+    WatchState,
+    save_state,
+)
+from domain_watch.tencent_domain import TencentDomainClient
 
 
-def print_domain_result(result: TencentDomainResult) -> None:
-    status = "AVAILABLE" if result.available else "TAKEN"
-    print(
-        f"{result.domain} {status} "
-        f"reason={result.reason!r} premium={result.premium} "
-        f"black_word={result.black_word} price={result.price} "
-        f"real_price={result.real_price} request_id={result.request_id}"
-    )
+class BootstrapLoader(Protocol):
+    def load(self, now: datetime) -> BootstrapData: ...
 
 
-def register_available_domains(
-    config: WatchConfig,
-    client: TencentDomainClient,
-    candidate_domains: tuple[str, ...],
-    state: WatchState,
-    notifier: PushNotifier | None,
-) -> None:
-    confirmed_domains = []
-    for domain in candidate_domains:
-        if not state.is_active(domain):
-            continue
-        result = client.check_domain(domain, config.period)
-        print_domain_result(result)
-        notify_tencent_result(notifier, result)
-        if result.available:
-            confirmed_domains.append(domain)
-    if not confirmed_domains:
-        return
-    domains_to_register = tuple(confirmed_domains)
-    response = client.create_domain_batch(domains_to_register, config)
-    print_register_response(domains_to_register, response)
-    log_id = getattr(response, "LogId", None)
-    request_id = getattr(response, "RequestId", None)
-    for domain in domains_to_register:
-        state.remove(
-            domain,
-            reason="register_submitted",
-            request_id=request_id,
-            log_id=str(log_id) if log_id is not None else None,
+class DomainRdapClient(Protocol):
+    def query(self, domain: str, endpoint: str, *, now: datetime) -> RdapResult: ...
+
+
+@dataclass(frozen=True, kw_only=True)
+class WatchServices:
+    bootstrap: BootstrapLoader
+    rdap: DomainRdapClient
+    tencent: TencentDomainClient
+    notifier: PushNotifier | None = None
+
+
+class DomainWatcher:
+    def __init__(
+        self,
+        config: WatchConfig,
+        services: WatchServices,
+        *,
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._config = config
+        self._services = services
+        self._now = now_provider or (lambda: datetime.now(UTC))
+        self._bootstrap_warning: str | None = None
+
+    def run_once(self, state: WatchState) -> None:
+        now = self._now()
+        for schedule in due_schedules(state, self._config.domains, now):
+            self._process_isolated(state, schedule)
+
+    def _process_isolated(self, state: WatchState, schedule: DomainSchedule) -> None:
+        now = self._now()
+        try:
+            if schedule.phase is DomainPhase.REGISTERING:
+                self._poll_registration(state, schedule, now=now)
+                return
+            self._query_rdap(state, schedule, now=now)
+        except Exception as error:
+            self._record_domain_failure(state, schedule, error=error, now=now)
+
+    def _poll_registration(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        now: datetime,
+    ) -> None:
+        poll_registration(
+            self._config,
+            state,
+            schedule,
+            client=self._services.tencent,
+            notifier=self._services.notifier,
+            now=now,
         )
-    save_state(config.state_file, state)
-    notify_register_response(notifier, domains_to_register, response)
 
+    def _query_rdap(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        now: datetime,
+    ) -> None:
+        bootstrap = self._services.bootstrap.load(now)
+        self._notify_bootstrap_warning(bootstrap)
+        endpoint = bootstrap.endpoint_for(schedule.domain)
+        host = endpoint_host(endpoint)
+        if self._rdap_is_cooling_down(state, host, now=now):
+            self._query_tencent_fallback(state, schedule, now=now)
+            return
+        try:
+            result = self._services.rdap.query(schedule.domain, endpoint, now=now)
+        except RdapRateLimited as error:
+            self._handle_rate_limit(state, schedule, error=error, now=now)
+            return
+        self._apply_rdap_result(state, schedule, result=result, now=now)
 
-def print_register_response(domains: tuple[str, ...], response: object) -> None:
-    log_id = getattr(response, "LogId", None)
-    request_id = getattr(response, "RequestId", None)
-    print(f"REGISTER_SUBMITTED domains={list(domains)} log_id={log_id} request_id={request_id}")
+    def _apply_rdap_result(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        result: RdapResult,
+        now: datetime,
+    ) -> None:
+        previous_statuses = apply_rdap_result(
+            schedule,
+            result,
+            self._config.schedule,
+            now=now,
+        )
+        save_state(self._config.state_file, state)
+        print_rdap_result(result, schedule)
+        self._notify_status_change(schedule, previous_statuses)
+        if not result.registered:
+            self._query_tencent_candidate(state, schedule, now=now)
 
+    def _handle_rate_limit(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        error: RdapRateLimited,
+        now: datetime,
+    ) -> None:
+        retry_at = error.retry_at or now + timedelta(
+            seconds=self._config.schedule.retry_interval_seconds
+        )
+        state.rdap_cooldowns[error.host] = retry_at
+        save_state(self._config.state_file, state)
+        notify(
+            self._services.notifier,
+            f"RDAP 限流 {error.host}",
+            f"冷却至 {retry_at.isoformat()}，期间改用腾讯云查询。",
+        )
+        self._query_tencent_fallback(state, schedule, now=now)
+        if schedule.phase not in {DomainPhase.REGISTERING, DomainPhase.INDETERMINATE}:
+            schedule.next_check_at = min(schedule.next_check_at, retry_at)
+            save_state(self._config.state_file, state)
 
-def notify_tencent_result(
-    notifier: PushNotifier | None,
-    result: TencentDomainResult,
-) -> None:
-    if notifier is None:
-        return
-    status = "可注册" if result.available else "不可注册"
-    notifier.send(
-        f"腾讯云查询 {result.domain} {status}",
-        (
-            f"域名: {result.domain}\n"
-            f"状态: {status}\n"
-            f"原因: {result.reason}\n"
-            f"溢价词: {result.premium}\n"
-            f"敏感词: {result.black_word}\n"
-            f"价格: {result.price}\n"
-            f"真实价格: {result.real_price}\n"
-            f"RequestId: {result.request_id}"
-        ),
-    )
+    def _query_tencent_fallback(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        now: datetime,
+    ) -> None:
+        print(f"RDAP cooldown active for {schedule.domain}; using Tencent fallback")
+        self._query_tencent_candidate(state, schedule, now=now)
 
+    def _query_tencent_candidate(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        now: datetime,
+    ) -> None:
+        interval = self._candidate_interval(schedule, now)
+        process_candidate(
+            self._config,
+            state,
+            schedule,
+            client=self._services.tencent,
+            notifier=self._services.notifier,
+            now=now,
+            unavailable_interval_seconds=interval,
+        )
 
-def notify_register_response(
-    notifier: PushNotifier | None,
-    domains: tuple[str, ...],
-    response: object,
-) -> None:
-    if notifier is None:
-        return
-    log_id = getattr(response, "LogId", None)
-    request_id = getattr(response, "RequestId", None)
-    notifier.send(
-        "注册任务已提交",
-        (
-            f"以下域名已提交注册并移出监听列表：{', '.join(domains)}\n"
-            f"LogId: {log_id}\n"
-            f"RequestId: {request_id}\n"
-            "后续请到腾讯云控制台确认订单并完成支付。"
-        ),
-    )
+    def _candidate_interval(self, schedule: DomainSchedule, now: datetime) -> int:
+        if in_drop_window(schedule, now):
+            return self._config.schedule.drop_interval_seconds
+        return self._config.schedule.retry_interval_seconds
 
+    def _rdap_is_cooling_down(
+        self,
+        state: WatchState,
+        host: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        retry_at = state.rdap_cooldowns.get(host)
+        if retry_at is None:
+            return False
+        if retry_at > now:
+            return True
+        del state.rdap_cooldowns[host]
+        save_state(self._config.state_file, state)
+        return False
 
-def watch_once(
-    config: WatchConfig,
-    runner: DomainCheckRunner,
-    client: TencentDomainClient,
-    state: WatchState,
-    notifier: PushNotifier | None = None,
-) -> int:
-    remaining_domains = tuple(state.active)
-    if not remaining_domains:
-        print("No active domains to watch.")
-        return config.interval_seconds
-    checked_domains = runner.check_domains(remaining_domains)
-    notify_domain_status_changes(config, state, checked_domains, notifier)
-    next_interval = next_watch_interval(config, checked_domains, remaining_domains)
-    checked_domain_names = {result.domain for result in checked_domains}
-    for domain in remaining_domains:
-        if domain not in checked_domain_names:
-            print(
-                f"domain-check {domain} FAILED error=no result; "
-                f"retrying in {next_interval}s"
+    def _record_domain_failure(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        error: Exception,
+        now: datetime,
+    ) -> None:
+        previous_error = schedule.last_error
+        record_failure(
+            schedule,
+            error,
+            self._config.schedule.retry_interval_seconds,
+            now=now,
+        )
+        save_state(self._config.state_file, state)
+        print(f"{schedule.domain} FAILED error={error}")
+        if previous_error != str(error):
+            notify(
+                self._services.notifier,
+                f"域名检查失败 {schedule.domain}",
+                str(error),
             )
-    for result in checked_domains:
-        if result.query_failed:
-            print(
-                f"domain-check {result.domain} FAILED "
-                f"error={result.error_message or 'no result'}; retrying in {next_interval}s"
-            )
-    candidate_domains = tencent_check_candidate_names(checked_domains, datetime.now(UTC))
-    if not candidate_domains:
-        print(f"No RDAP available candidates: {list(remaining_domains)}")
-        return next_interval
-    register_available_domains(
-        config,
-        client,
-        candidate_domains,
-        state,
-        notifier,
-    )
-    return next_interval
 
+    def _notify_bootstrap_warning(self, bootstrap: BootstrapData) -> None:
+        if not bootstrap.stale or bootstrap.refresh_error == self._bootstrap_warning:
+            return
+        self._bootstrap_warning = bootstrap.refresh_error
+        notify(
+            self._services.notifier,
+            "IANA RDAP Bootstrap 刷新失败",
+            f"正在显式使用 {bootstrap.fetched_at.isoformat()} 的缓存：{bootstrap.refresh_error}",
+        )
 
-def notify_domain_status_changes(
-    config: WatchConfig,
-    state: WatchState,
-    results: tuple[DomainCheckResult, ...],
-    notifier: PushNotifier | None,
-) -> None:
-    changed_results: list[tuple[DomainCheckResult, tuple[str, ...]]] = []
-    state_changed = False
-    for result in results:
-        if result.query_failed or not result.statuses:
-            continue
-        previous_statuses = state.update_statuses(result.domain, result.statuses)
+    def _notify_status_change(
+        self,
+        schedule: DomainSchedule,
+        previous_statuses: tuple[str, ...] | None,
+    ) -> None:
         if previous_statuses is None:
-            continue
-        state_changed = True
-        if previous_statuses:
-            changed_results.append((result, previous_statuses))
-    if state_changed:
-        save_state(config.state_file, state)
-    for result, previous_statuses in changed_results:
-        notify_domain_status_change(notifier, result, previous_statuses)
+            return
+        notify(
+            self._services.notifier,
+            f"域名状态更新 {schedule.domain}",
+            f"原状态: {format_statuses(previous_statuses)}\n"
+            f"新状态: {format_statuses(schedule.statuses)}\n"
+            f"阶段: {schedule.phase.value}",
+        )
 
 
-def notify_domain_status_change(
-    notifier: PushNotifier | None,
-    result: DomainCheckResult,
-    previous_statuses: tuple[str, ...],
-) -> None:
-    if notifier is None:
-        return
-    current_statuses = format_statuses(result.statuses)
-    notifier.send(
-        f"域名状态码更新 {result.domain}",
-        (
-            f"域名: {result.domain}\n"
-            f"原状态码: {format_statuses(previous_statuses)}\n"
-            f"新状态码: {current_statuses}\n"
-            f"可注册: {'是' if result.available else '否'}\n"
-            f"过期时间: {format_expires_at(result)}"
-        ),
-    )
-
-
-def tencent_check_candidate_names(
-    results: tuple[DomainCheckResult, ...],
-    now: datetime,
-) -> tuple[str, ...]:
-    return tuple(
-        result.domain
-        for result in results
-        if result.available is True and not has_future_expiration(result, now)
-    )
-
-
-def has_future_expiration(result: DomainCheckResult, now: datetime) -> bool:
-    return result.expires_at is not None and result.expires_at > now
-
-
-def next_watch_interval(
-    config: WatchConfig,
-    results: tuple[DomainCheckResult, ...],
-    expected_domains: tuple[str, ...] = (),
-) -> int:
-    result_domains = {result.domain for result in results}
-    if any(result.query_failed for result in results) or any(
-        domain not in result_domains for domain in expected_domains
-    ):
-        return config.retry_interval_seconds
-    now = datetime.now(UTC)
-    any_expired = any(
-        result.expires_at is not None and result.expires_at <= now
-        for result in results
-    )
-    if any_expired:
-        return config.expired_interval_seconds
-    return config.interval_seconds
-
-
-def print_domain_check_result(result: DomainCheckResult) -> None:
+def print_rdap_result(result: RdapResult, schedule: DomainSchedule) -> None:
+    availability = "REGISTERED" if result.registered else "NOT_FOUND"
     expires_at = result.expires_at.isoformat() if result.expires_at else "unknown"
-    status = "AVAILABLE" if result.available else "TAKEN"
     print(
-        f"domain-check {result.domain} {status} "
-        f"expires_at={expires_at} statuses={format_statuses(result.statuses)}"
+        f"RDAP {result.domain} {availability} expires_at={expires_at} "
+        f"statuses={format_statuses(result.statuses)} phase={schedule.phase.value}"
     )
-
-
-def format_expires_at(result: DomainCheckResult) -> str:
-    return result.expires_at.isoformat() if result.expires_at else "unknown"
 
 
 def format_statuses(statuses: tuple[str, ...]) -> str:
     return ", ".join(statuses) if statuses else "unknown"
-
-
-def watch_forever(
-    config: WatchConfig,
-    runner: DomainCheckRunner,
-    client: TencentDomainClient,
-    notifier: PushNotifier | None,
-) -> None:
-    state = init_state(config.state_file, config.domains)
-    stop_signal = StopSignal()
-    while not stop_signal.received and state.active:
-        try:
-            next_interval = watch_once(
-                config,
-                runner,
-                client,
-                state,
-                notifier,
-            )
-        except subprocess.CalledProcessError as error:
-            if stop_signal.received and error.returncode < 0:
-                print("domain-check was interrupted by shutdown signal.")
-                break
-            raise
-        stop_signal.wait(next_interval)
-    print("Watch loop ended.")
-
-
-class StopSignal:
-    def __init__(self) -> None:
-        self.received = False
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
-
-    def _handle_signal(self, signum: int, _frame: object) -> None:
-        if self.received:
-            return
-        self.received = True
-        print(f"Received signal {signum}; exiting after current iteration.")
-
-    def wait(self, seconds: int) -> None:
-        deadline = time.monotonic() + seconds
-        while not self.received and time.monotonic() < deadline:
-            time.sleep(min(1, deadline - time.monotonic()))
-
-
-def main() -> None:
-    load_dotenv()
-    config = load_config()
-    runner = CliDomainCheckRunner(config.domain_check_bin)
-    client = TencentSdkDomainClient(config.secret_id, config.secret_key)
-    notifier = load_push_notifier()
-    watch_forever(config, runner, client, notifier)
-
-
-if __name__ == "__main__":
-    main()
