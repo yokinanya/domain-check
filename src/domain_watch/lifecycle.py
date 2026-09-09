@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from datetime import datetime, timedelta
 
 from domain_watch.config import ScheduleConfig
@@ -30,6 +31,7 @@ def apply_rdap_result(
     schedule.previous_check_at = now
     schedule.statuses = result.statuses
     schedule.last_error = None
+    schedule.failure_count = 0
     if not result.registered:
         schedule.phase = DomainPhase.AVAILABLE
         schedule.next_check_at = now
@@ -136,6 +138,17 @@ def next_wake_at(state: WatchState) -> datetime | None:
     return min(item.next_check_at for item in active)
 
 
+MAX_FAILURE_BACKOFF_SECONDS = 3600
+FAILURE_JITTER_FRACTION = 0.2
+
+
+def failure_backoff_seconds(retry_seconds: int, failure_count: int) -> int:
+    multiplier = min(2 ** max(0, failure_count - 1), MAX_FAILURE_BACKOFF_SECONDS / retry_seconds)
+    base = retry_seconds * multiplier
+    jitter = base * FAILURE_JITTER_FRACTION
+    return int(base + random.uniform(0, jitter))
+
+
 def record_failure(
     schedule: DomainSchedule,
     error: Exception,
@@ -143,8 +156,10 @@ def record_failure(
     *,
     now: datetime,
 ) -> None:
+    schedule.failure_count += 1
     schedule.last_error = str(error)
-    schedule.next_check_at = now + timedelta(seconds=retry_seconds)
+    delay = failure_backoff_seconds(retry_seconds, schedule.failure_count)
+    schedule.next_check_at = now + timedelta(seconds=delay)
 
 
 def in_drop_window(schedule: DomainSchedule, now: datetime) -> bool:
