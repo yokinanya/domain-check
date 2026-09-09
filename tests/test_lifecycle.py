@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from domain_watch.config import ScheduleConfig
-from domain_watch.lifecycle import apply_rdap_result, due_schedules
+from domain_watch.lifecycle import apply_rdap_result, due_schedules, record_failure
 from domain_watch.rdap import RdapResult
 from domain_watch.state import DomainPhase, DomainSchedule, WatchState
 
@@ -98,3 +98,39 @@ def test_due_domains_prioritize_earliest_expected_drop_then_config_order() -> No
     due = due_schedules(state, ("first.com", "second.com"), NOW)
 
     assert [item.domain for item in due] == ["second.com", "first.com"]
+
+
+def test_record_failure_backs_off_exponentially() -> None:
+    schedule = DomainSchedule(domain="example.com", next_check_at=NOW)
+    base = ScheduleConfig().retry_interval_seconds
+
+    for count, expected_min, expected_max in [
+        (1, base, base * 1.2),
+        (2, base * 2, base * 2.4),
+        (3, base * 4, base * 4.8),
+    ]:
+        record_failure(schedule, RuntimeError("boom"), base, now=NOW)
+        delay = (schedule.next_check_at - NOW).total_seconds()
+        assert schedule.failure_count == count
+        assert expected_min <= delay <= expected_max
+
+
+def test_record_failure_backoff_caps_at_one_hour() -> None:
+    schedule = DomainSchedule(domain="example.com", next_check_at=NOW)
+    base = ScheduleConfig().retry_interval_seconds
+
+    for _ in range(10):
+        record_failure(schedule, RuntimeError("boom"), base, now=NOW)
+
+    delay = (schedule.next_check_at - NOW).total_seconds()
+    assert delay <= 3600 * 1.2
+
+
+def test_successful_rdap_result_resets_failure_count() -> None:
+    schedule = DomainSchedule(domain="example.com", next_check_at=NOW, failure_count=3)
+    result = registered_result(NOW + timedelta(days=30))
+
+    apply_rdap_result(schedule, result, ScheduleConfig(), now=NOW)
+
+    assert schedule.failure_count == 0
+    assert schedule.last_error is None
