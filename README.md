@@ -49,6 +49,7 @@ RDAP_BOOTSTRAP_TTL_SECONDS=86400
 RDAP_REQUESTS_PER_SECOND=1
 RDAP_HOST_LIMITS_JSON={}
 RDAP_HTTP_TIMEOUT_SECONDS=10
+DOMAIN_WATCH_PROXY=http://127.0.0.1:7890  # 可选，仅用于 RDAP
 ```
 
 限流按 RDAP 主机共享。收到 429 时优先遵守 `Retry-After`，缺失时冷却 15 分钟；冷却期间明确改用腾讯云查询。腾讯云查询、注册提交和任务详情使用互相独立的限流器。

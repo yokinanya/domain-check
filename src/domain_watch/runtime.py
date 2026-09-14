@@ -71,7 +71,7 @@ def recover_indeterminate_attempts(
 
 
 def build_services(config: WatchConfig) -> tuple[WatchServices, httpx.Client]:
-    http_client = httpx.Client()
+    http_client = httpx.Client(proxy=config.rdap.proxy)
     transport = HttpxTransport(http_client)
     limiter = RateLimiter()
     sdk_client = TencentSdkDomainClient(config.secret_id, config.secret_key)
