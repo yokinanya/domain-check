@@ -35,11 +35,13 @@ def test_load_config_reads_new_settings(monkeypatch: pytest.MonkeyPatch) -> None
     set_required_env(monkeypatch)
     monkeypatch.setenv("RDAP_HOST_LIMITS_JSON", '{"rdap.example":0.5}')
     monkeypatch.setenv("DOMAIN_WATCH_TLD_PENDING_DELETE_DAYS_JSON", '{".cc":4.5}')
+    monkeypatch.setenv("DOMAIN_WATCH_PROXY", "http://127.0.0.1:7890")
 
     config = load_config()
 
     assert config.domains == ("example.com", "target.cc")
     assert config.rdap.rate_for_host("rdap.example") == 0.5
+    assert config.rdap.proxy == "http://127.0.0.1:7890"
     assert config.schedule.pending_delete_days("target.cc") == 4.5
     assert config.schedule.drop_interval_seconds == DEFAULT_DROP_INTERVAL_SECONDS
     assert config.schedule.retry_interval_seconds == DEFAULT_RETRY_INTERVAL_SECONDS

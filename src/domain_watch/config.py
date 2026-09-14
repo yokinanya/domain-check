@@ -28,6 +28,7 @@ class RdapConfig:
     requests_per_second: float = DEFAULT_RDAP_REQUESTS_PER_SECOND
     host_limits: tuple[tuple[str, float], ...] = ()
     http_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
+    proxy: str | None = None
 
     def rate_for_host(self, host: str) -> float:
         return dict(self.host_limits).get(host, self.requests_per_second)
@@ -133,6 +134,7 @@ def load_rdap_config() -> RdapConfig:
         http_timeout_seconds=read_positive_float_env(
             "RDAP_HTTP_TIMEOUT_SECONDS", DEFAULT_HTTP_TIMEOUT_SECONDS
         ),
+        proxy=os.getenv("DOMAIN_WATCH_PROXY") or None,
     )
 
 
