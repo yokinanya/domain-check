@@ -164,3 +164,19 @@ def record_failure(
 
 def in_drop_window(schedule: DomainSchedule, now: datetime) -> bool:
     return schedule.drop_window is not None and now >= schedule.drop_window.starts_at
+
+
+# Registry RDAP responses are cached, so the 404 that follows a drop can lag by hours.
+# Inside the drop window the Tencent check runs every round regardless of RDAP; phase is
+# checked too because mark_registration_failed keeps drop_window but resets the phase.
+def should_query_tencent(schedule: DomainSchedule, now: datetime) -> bool:
+    return schedule.phase is DomainPhase.PENDING_DELETE and in_drop_window(schedule, now)
+
+
+# RDAP is the primary channel only while it is still cheap to lose a round. Far from the drop,
+# one flaky response tells us nothing that the exact expires_at schedule has not already said,
+# so a fallback query there would shed a precise wake-up in favour of a 15-minute poll. Inside
+# the drop window, or once RDAP has already reported the domain unregistered, a single timeout
+# can cost the whole acquisition, so a secondary opinion is worth having.
+def is_hot_pursuit(schedule: DomainSchedule, now: datetime) -> bool:
+    return schedule.phase is DomainPhase.AVAILABLE or should_query_tencent(schedule, now)

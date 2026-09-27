@@ -9,12 +9,14 @@ from domain_watch.config import WatchConfig
 from domain_watch.lifecycle import (
     apply_rdap_result,
     due_schedules,
-    in_drop_window,
+    is_hot_pursuit,
     record_failure,
+    should_query_tencent,
 )
 from domain_watch.push_notify import PushNotifier
 from domain_watch.rdap import (
     BootstrapData,
+    RdapError,
     RdapRateLimited,
     RdapResult,
     endpoint_host,
@@ -57,6 +59,7 @@ class DomainWatcher:
         self._services = services
         self._now = now_provider or (lambda: datetime.now(UTC))
         self._bootstrap_warning: str | None = None
+        self._tencent_error_by_domain: dict[str, str] = {}
 
     def run_once(self, state: WatchState) -> None:
         now = self._now()
@@ -108,7 +111,56 @@ class DomainWatcher:
         except RdapRateLimited as error:
             self._handle_rate_limit(state, schedule, error=error, now=now)
             return
+        except RdapError as error:
+            self._handle_rdap_error(state, schedule, error=error, now=now)
+            return
         self._apply_rdap_result(state, schedule, result=result, now=now)
+
+    def _handle_rdap_error(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        error: RdapError,
+        now: datetime,
+    ) -> None:
+        if error.response is not None:
+            self._handle_rdap_error_response(state, schedule, error=error, now=now)
+            return
+        # A query that never produced an answer. No status was obtained, so the RDAP
+        # schedule is left untouched and the domain keeps its existing cadence.
+        print(f"{schedule.domain} RDAP FAILED error={error}")
+        if not is_hot_pursuit(schedule, now):
+            self._record_domain_failure(state, schedule, error=error, now=now)
+            return
+        notify(
+            self._services.notifier,
+            f"RDAP 查询失败 {schedule.domain}",
+            f"{error}\n已改用腾讯云兜底，RDAP 调度保持原节奏。",
+        )
+        self._query_tencent_candidate(state, schedule, now=now)
+
+    def _handle_rdap_error_response(
+        self,
+        state: WatchState,
+        schedule: DomainSchedule,
+        *,
+        error: RdapError,
+        now: datetime,
+    ) -> None:
+        # The registry answered, just not with the object we asked for. Far from the drop we
+        # only back off; in a hot pursuit the answer is inconclusive rather than negative, so
+        # the domain keeps its cadence and the secondary channel is asked instead.
+        print(f"{schedule.domain} RDAP ERROR RESPONSE error={error}")
+        if not is_hot_pursuit(schedule, now):
+            self._record_domain_failure(state, schedule, error=error, now=now)
+            return
+        notify(
+            self._services.notifier,
+            f"RDAP 响应异常 {schedule.domain}",
+            f"{error}\n已改用腾讯云兜底，RDAP 调度保持原节奏。",
+        )
+        self._query_tencent_candidate(state, schedule, now=now)
 
     def _apply_rdap_result(
         self,
@@ -127,7 +179,7 @@ class DomainWatcher:
         save_state(self._config.state_file, state)
         print_rdap_result(result, schedule)
         self._notify_status_change(schedule, previous_statuses)
-        if not result.registered:
+        if not result.registered or should_query_tencent(schedule, now):
             self._query_tencent_candidate(state, schedule, now=now)
 
     def _handle_rate_limit(
@@ -170,19 +222,43 @@ class DomainWatcher:
         *,
         now: datetime,
     ) -> None:
-        interval = self._candidate_interval(schedule, now)
-        process_candidate(
-            self._config,
-            state,
-            schedule,
-            client=self._services.tencent,
-            notifier=self._services.notifier,
-            now=now,
-            unavailable_interval_seconds=interval,
+        try:
+            process_candidate(
+                self._config,
+                state,
+                schedule,
+                client=self._services.tencent,
+                notifier=self._services.notifier,
+                now=now,
+                unavailable_interval_seconds=self._candidate_interval(schedule, now),
+            )
+        except Exception as error:
+            self._note_tencent_failure(schedule, error=error)
+            return
+        self._tencent_error_by_domain.pop(schedule.domain, None)
+
+    def _note_tencent_failure(
+        self,
+        schedule: DomainSchedule,
+        *,
+        error: Exception,
+    ) -> None:
+        # Tencent is a secondary channel; its health must not disturb the RDAP schedule.
+        # Inside the drop window the 5-second cadence comes from RDAP, and record_failure
+        # would push the domain 15+ minutes out of the window on a single hiccup.
+        message = str(error)
+        print(f"{schedule.domain} TENCENT FAILED error={error}")
+        if self._tencent_error_by_domain.get(schedule.domain) == message:
+            return
+        self._tencent_error_by_domain[schedule.domain] = message
+        notify(
+            self._services.notifier,
+            f"腾讯云兜底查询失败 {schedule.domain}",
+            f"{message}\nRDAP 调度不受影响，将按原节奏重试。",
         )
 
     def _candidate_interval(self, schedule: DomainSchedule, now: datetime) -> int:
-        if in_drop_window(schedule, now):
+        if should_query_tencent(schedule, now):
             return self._config.schedule.drop_interval_seconds
         return self._config.schedule.retry_interval_seconds
 

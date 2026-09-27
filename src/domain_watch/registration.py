@@ -30,12 +30,15 @@ def process_candidate(
     now: datetime,
     unavailable_interval_seconds: int,
 ) -> None:
+    # Claim the next poll slot before the network call, the same way begin_registration
+    # records its intent first: if the secondary channel fails, the domain must not be
+    # left immediately due, which would spin the watch loop against a failing API.
+    schedule.next_check_at = now + timedelta(seconds=unavailable_interval_seconds)
     result = client.check_domain(schedule.domain, config.period)
     print_tencent_result(result)
     notify_tencent_transition(schedule, result, notifier)
     schedule.last_tencent_available = result.available
     if not result.available:
-        schedule.next_check_at = now + timedelta(seconds=unavailable_interval_seconds)
         save_state(config.state_file, state)
         return
     begin_registration(

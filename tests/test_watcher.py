@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
+
 from domain_watch.config import WatchConfig
 from domain_watch.main import DomainWatcher, WatchServices
 from domain_watch.rate_limit import RateLimiter, RateLimitPolicy
-from domain_watch.rdap import BootstrapData, RdapRateLimited, RdapResult
-from domain_watch.state import DomainPhase, DomainSchedule, WatchState
+from domain_watch.rdap import BootstrapData, RdapError, RdapRateLimited, RdapResult
+from domain_watch.state import DomainPhase, DomainSchedule, DropWindow, WatchState
 from domain_watch.tencent_domain import (
     RegistrationStatus,
     RegistrationSubmission,
@@ -63,6 +65,12 @@ class FakeTencent:
 
     def registration_status(self, _log_id: int, domain: str) -> RegistrationStatus:
         return RegistrationStatus(domain, "doing")
+
+
+class FlakyTencent(FakeTencent):
+    def check_domain(self, domain: str, _period: int) -> TencentDomainResult:
+        self.check_calls.append(domain)
+        raise RuntimeError("CheckDomain request timed out")
 
 
 def config(tmp_path: Path, domains: tuple[str, ...]) -> WatchConfig:
@@ -153,6 +161,259 @@ def test_rdap_404_outside_drop_window_retries_tencent_conservatively(
 
     schedule = state.domains["example.com"]
     assert schedule.phase is DomainPhase.AVAILABLE
+    assert schedule.next_check_at == NOW + timedelta(minutes=15)
+
+
+def test_drop_window_queries_tencent_even_when_rdap_says_registered(
+    tmp_path: Path,
+) -> None:
+    result = RdapResult(
+        domain="example.com",
+        registered=True,
+        expires_at=NOW - timedelta(days=40),
+        statuses=("pendingDelete",),
+        endpoint=ENDPOINT,
+        queried_at=NOW,
+    )
+    rdap = FakeRdap({"example.com": result})
+    tencent = FakeTencent()
+    state = WatchState(
+        domains={
+            "example.com": DomainSchedule(
+                domain="example.com",
+                phase=DomainPhase.PENDING_DELETE,
+                next_check_at=NOW,
+                previous_check_at=NOW - timedelta(days=6),
+                pending_delete_first_seen_at=NOW - timedelta(days=6),
+                drop_window=DropWindow(
+                    starts_at=NOW - timedelta(hours=1),
+                    ends_at=NOW + timedelta(days=4),
+                ),
+            )
+        }
+    )
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert schedule.phase is DomainPhase.PENDING_DELETE
+    assert schedule.drop_window is not None
+    assert schedule.drop_window.starts_at == NOW - timedelta(hours=1)
+    assert tencent.check_calls == ["example.com"]
+    assert schedule.next_check_at == NOW + timedelta(seconds=5)
+
+
+def test_pending_delete_before_drop_window_does_not_query_tencent(tmp_path: Path) -> None:
+    result = RdapResult(
+        domain="example.com",
+        registered=True,
+        expires_at=NOW - timedelta(days=40),
+        statuses=("pendingDelete",),
+        endpoint=ENDPOINT,
+        queried_at=NOW,
+    )
+    rdap = FakeRdap({"example.com": result})
+    tencent = FakeTencent()
+    state = WatchState(
+        domains={
+            "example.com": DomainSchedule(
+                domain="example.com",
+                phase=DomainPhase.PENDING_DELETE,
+                next_check_at=NOW,
+                previous_check_at=NOW - timedelta(days=6),
+                pending_delete_first_seen_at=NOW - timedelta(days=1),
+                drop_window=DropWindow(
+                    starts_at=NOW + timedelta(hours=1),
+                    ends_at=NOW + timedelta(days=4),
+                ),
+            )
+        }
+    )
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == []
+    assert schedule.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_tencent_failure_inside_drop_window_keeps_five_second_cadence(
+    tmp_path: Path,
+) -> None:
+    result = RdapResult(
+        domain="example.com",
+        registered=True,
+        expires_at=NOW - timedelta(days=40),
+        statuses=("pendingDelete",),
+        endpoint=ENDPOINT,
+        queried_at=NOW,
+    )
+    tencent = FlakyTencent()
+    state = WatchState(
+        domains={
+            "example.com": DomainSchedule(
+                domain="example.com",
+                phase=DomainPhase.PENDING_DELETE,
+                next_check_at=NOW,
+                previous_check_at=NOW - timedelta(days=6),
+                pending_delete_first_seen_at=NOW - timedelta(days=6),
+                drop_window=DropWindow(
+                    starts_at=NOW - timedelta(hours=1),
+                    ends_at=NOW + timedelta(days=4),
+                ),
+            )
+        }
+    )
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(FakeRdap({"example.com": result}), tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == ["example.com"]
+    assert schedule.next_check_at == NOW + timedelta(seconds=5)
+    assert schedule.failure_count == 0
+    assert schedule.last_error is None
+    assert schedule.phase is DomainPhase.PENDING_DELETE
+
+
+def error_response(status: int) -> httpx.Response:
+    return httpx.Response(status, request=httpx.Request("GET", ENDPOINT))
+
+
+def hot_schedule(domain: str = "example.com") -> DomainSchedule:
+    return DomainSchedule(
+        domain=domain,
+        phase=DomainPhase.PENDING_DELETE,
+        next_check_at=NOW,
+        previous_check_at=NOW - timedelta(days=6),
+        pending_delete_first_seen_at=NOW - timedelta(days=6),
+        drop_window=DropWindow(
+            starts_at=NOW - timedelta(hours=1),
+            ends_at=NOW + timedelta(days=4),
+        ),
+    )
+
+
+def cold_schedule(domain: str = "example.com") -> DomainSchedule:
+    return DomainSchedule(
+        domain=domain,
+        phase=DomainPhase.SCHEDULED,
+        next_check_at=NOW,
+        expires_at=NOW + timedelta(days=30),
+    )
+
+
+def test_rdap_timeout_in_drop_window_falls_back_to_tencent(tmp_path: Path) -> None:
+    rdap = FakeRdap({"example.com": RdapError("RDAP request failed for example.com: timed out")})
+    tencent = FakeTencent()
+    state = WatchState(domains={"example.com": hot_schedule()})
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == ["example.com"]
+    assert schedule.next_check_at == NOW + timedelta(seconds=5)
+    assert schedule.failure_count == 0
+    assert schedule.phase is DomainPhase.PENDING_DELETE
+
+
+def test_rdap_timeout_far_from_drop_does_not_query_tencent(tmp_path: Path) -> None:
+    rdap = FakeRdap({"example.com": RdapError("RDAP request failed for example.com: timed out")})
+    tencent = FakeTencent()
+    state = WatchState(domains={"example.com": cold_schedule()})
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == []
+    assert schedule.failure_count == 1
+    assert schedule.next_check_at >= NOW + timedelta(minutes=15)
+
+
+def test_rdap_error_response_in_drop_window_falls_back_to_tencent(tmp_path: Path) -> None:
+    error = RdapError(
+        "Invalid RDAP response for example.com: server error",
+        response=error_response(500),
+    )
+    rdap = FakeRdap({"example.com": error})
+    tencent = FakeTencent()
+    state = WatchState(domains={"example.com": hot_schedule()})
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == ["example.com"]
+    assert schedule.next_check_at == NOW + timedelta(seconds=5)
+    assert schedule.failure_count == 0
+
+
+def test_rdap_error_response_far_from_drop_keeps_backoff(tmp_path: Path) -> None:
+    error = RdapError(
+        "Invalid RDAP response for example.com: server error",
+        response=error_response(500),
+    )
+    rdap = FakeRdap({"example.com": error})
+    tencent = FakeTencent()
+    state = WatchState(domains={"example.com": cold_schedule()})
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(rdap, tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == []
+    assert schedule.failure_count == 1
+    assert schedule.next_check_at >= NOW + timedelta(minutes=15)
+
+
+def test_tencent_failure_leaves_domain_due_later_not_immediately(tmp_path: Path) -> None:
+    result = RdapResult(
+        domain="example.com",
+        registered=False,
+        expires_at=None,
+        statuses=(),
+        endpoint=ENDPOINT,
+        queried_at=NOW,
+    )
+    tencent = FlakyTencent()
+    state = WatchState(
+        domains={"example.com": DomainSchedule(domain="example.com", next_check_at=NOW)}
+    )
+
+    DomainWatcher(
+        config(tmp_path, ("example.com",)),
+        services(FakeRdap({"example.com": result}), tencent),
+        now_provider=lambda: NOW,
+    ).run_once(state)
+
+    schedule = state.domains["example.com"]
+    assert tencent.check_calls == ["example.com"]
+    assert schedule.failure_count == 0
     assert schedule.next_check_at == NOW + timedelta(minutes=15)
 
 

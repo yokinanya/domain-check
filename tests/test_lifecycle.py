@@ -3,9 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from domain_watch.config import ScheduleConfig
-from domain_watch.lifecycle import apply_rdap_result, due_schedules, record_failure
+from domain_watch.lifecycle import (
+    apply_rdap_result,
+    due_schedules,
+    is_hot_pursuit,
+    record_failure,
+)
 from domain_watch.rdap import RdapResult
-from domain_watch.state import DomainPhase, DomainSchedule, WatchState
+from domain_watch.state import DomainPhase, DomainSchedule, DropWindow, WatchState
 
 NOW = datetime(2026, 8, 28, 1, 0, tzinfo=UTC)
 
@@ -85,6 +90,37 @@ def test_pending_delete_switches_to_five_second_checks_in_window() -> None:
     apply_rdap_result(schedule, result, ScheduleConfig(), now=NOW)
 
     assert schedule.next_check_at == NOW + timedelta(seconds=5)
+
+
+def test_is_hot_pursuit_only_covers_phases_where_a_missed_round_costs_the_domain() -> None:
+    started = DropWindow(
+        starts_at=NOW - timedelta(hours=1),
+        ends_at=NOW + timedelta(days=4),
+    )
+    pending = DropWindow(
+        starts_at=NOW + timedelta(hours=1),
+        ends_at=NOW + timedelta(days=4),
+    )
+    cases = [
+        (DomainPhase.SCHEDULED, None, False),
+        (DomainPhase.WATCHING, None, False),
+        (DomainPhase.PENDING_DELETE, pending, False),
+        (DomainPhase.PENDING_DELETE, started, True),
+        (DomainPhase.AVAILABLE, None, True),
+        (DomainPhase.AVAILABLE, pending, True),
+        (DomainPhase.REGISTERING, None, False),
+        (DomainPhase.INDETERMINATE, None, False),
+        (DomainPhase.REMOVED, None, False),
+    ]
+
+    for phase, window, expected in cases:
+        schedule = DomainSchedule(
+            domain="example.com",
+            phase=phase,
+            next_check_at=NOW,
+            drop_window=window,
+        )
+        assert is_hot_pursuit(schedule, NOW) is expected, phase
 
 
 def test_due_domains_prioritize_earliest_expected_drop_then_config_order() -> None:

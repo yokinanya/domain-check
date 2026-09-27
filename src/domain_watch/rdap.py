@@ -20,7 +20,15 @@ BOOTSTRAP_REFRESH_RETRY_SECONDS = 900
 
 
 class RdapError(RuntimeError):
-    pass
+    """An RDAP query that produced no usable result.
+
+    `response` is the HTTP response that was received but could not be turned into a
+    result, or None when no response arrived at all (timeouts, connection and TLS errors).
+    """
+
+    def __init__(self, message: str, *, response: httpx.Response | None = None) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 class RdapRateLimited(RdapError):
@@ -217,7 +225,10 @@ def parse_rdap_response(
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, json.JSONDecodeError) as error:
-        raise RdapError(f"Invalid RDAP response for {domain}: {error}") from error
+        raise RdapError(
+            f"Invalid RDAP response for {domain}: {error}",
+            response=response,
+        ) from error
     if not isinstance(payload, dict):
         raise RdapError(f"RDAP response for {domain} must be an object")
     return RdapResult(
