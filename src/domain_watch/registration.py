@@ -36,8 +36,6 @@ def process_candidate(
     schedule.next_check_at = now + timedelta(seconds=unavailable_interval_seconds)
     result = client.check_domain(schedule.domain, config.period)
     print_tencent_result(result)
-    notify_tencent_transition(schedule, result, notifier)
-    schedule.last_tencent_available = result.available
     if not result.available:
         save_state(config.state_file, state)
         return
@@ -196,25 +194,6 @@ def mark_registration_failed(
         notifier,
         f"域名注册失败 {schedule.domain}",
         f"原因: {schedule.last_error}\n将在重试间隔后恢复监听。",
-    )
-
-
-def notify_tencent_transition(
-    schedule: DomainSchedule,
-    result: TencentDomainResult,
-    notifier: PushNotifier | None,
-) -> None:
-    if schedule.last_tencent_available == result.available:
-        return
-    status = "可注册" if result.available else "不可注册"
-    notify(
-        notifier,
-        f"腾讯云查询 {result.domain} {status}",
-        (
-            f"域名: {result.domain}\n状态: {status}\n原因: {result.reason}\n"
-            f"溢价词: {result.premium}\n价格: {result.price}\n"
-            f"真实价格: {result.real_price}\nRequestId: {result.request_id}"
-        ),
     )
 
 

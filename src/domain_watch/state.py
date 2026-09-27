@@ -49,7 +49,6 @@ class DomainSchedule:
     pending_delete_first_seen_at: datetime | None = None
     drop_window: DropWindow | None = None
     registration: RegistrationAttempt | None = None
-    last_tencent_available: bool | None = None
     removed_at: datetime | None = None
     last_error: str | None = None
     failure_count: int = 0
@@ -116,7 +115,6 @@ def schedule_to_dict(schedule: DomainSchedule) -> dict[str, Any]:
         "pending_delete_first_seen_at": datetime_json(schedule.pending_delete_first_seen_at),
         "drop_window": drop_window_to_dict(schedule.drop_window),
         "registration": registration_to_dict(schedule.registration),
-        "last_tencent_available": schedule.last_tencent_available,
         "removed_at": datetime_json(schedule.removed_at),
         "last_error": schedule.last_error,
         "failure_count": schedule.failure_count,
@@ -180,10 +178,6 @@ def schedule_from_dict(domain: str, data: object) -> DomainSchedule:
         pending_delete_first_seen_at=parse_datetime(data.get("pending_delete_first_seen_at")),
         drop_window=drop_window_from_dict(data.get("drop_window")),
         registration=registration_from_dict(data.get("registration")),
-        last_tencent_available=optional_boolean(
-            data.get("last_tencent_available"),
-            "last_tencent_available",
-        ),
         removed_at=parse_datetime(data.get("removed_at")),
         last_error=optional_string(data.get("last_error"), "last_error"),
         failure_count=optional_count(data.get("failure_count"), "failure_count"),
@@ -228,12 +222,6 @@ def optional_count(value: object, field_name: str) -> int:
     if not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
     return value
-
-
-def optional_boolean(value: object, field_name: str) -> bool | None:
-    if value is None or isinstance(value, bool):
-        return value
-    raise ValueError(f"{field_name} must be a boolean or null")
 
 
 def status_tuple(value: object) -> tuple[str, ...]:

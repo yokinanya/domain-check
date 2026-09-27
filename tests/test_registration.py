@@ -178,21 +178,69 @@ def test_failed_async_task_returns_to_watching(tmp_path: Path) -> None:
     assert schedule.last_error == "insufficient balance"
 
 
-def test_repeated_unavailable_result_does_not_repeat_notification(tmp_path: Path) -> None:
+def test_availability_result_is_never_notified(tmp_path: Path) -> None:
+    """A plain 可注册/不可注册 result is silent; only registration events push."""
     config = build_config(tmp_path)
-    state, schedule = build_state()
-    client = FakeTencentClient(available=False)
     notifier = FakeNotifier()
 
-    for _index in range(2):
+    taken_state, taken_schedule = build_state()
+    taken = FakeTencentClient(available=False)
+    for _index in range(3):
         process_candidate(
             config,
-            state,
-            schedule,
-            client=client,
+            taken_state,
+            taken_schedule,
+            client=taken,
             notifier=notifier,
             now=NOW,
             unavailable_interval_seconds=5,
         )
 
-    assert len(notifier.messages) == 1
+    assert notifier.messages == []
+
+    available_state, available_schedule = build_state()
+    process_candidate(
+        config,
+        available_state,
+        available_schedule,
+        client=FakeTencentClient(available=True),
+        notifier=notifier,
+        now=NOW,
+        unavailable_interval_seconds=5,
+    )
+
+    assert [title for title, _content in notifier.messages] == [
+        "注册任务已提交 example.com"
+    ]
+
+
+def test_registration_success_still_notifies(tmp_path: Path) -> None:
+    config = build_config(tmp_path)
+    state, schedule = build_state()
+    client = FakeTencentClient()
+    notifier = FakeNotifier()
+
+    process_candidate(
+        config,
+        state,
+        schedule,
+        client=client,
+        notifier=notifier,
+        now=NOW,
+        unavailable_interval_seconds=5,
+    )
+    client.status = RegistrationStatus("example.com", "success")
+
+    poll_registration(
+        config,
+        state,
+        schedule,
+        client=client,
+        notifier=notifier,
+        now=NOW,
+    )
+
+    assert [title for title, _content in notifier.messages] == [
+        "注册任务已提交 example.com",
+        "域名注册成功 example.com",
+    ]
